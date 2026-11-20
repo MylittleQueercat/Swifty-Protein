@@ -4,9 +4,6 @@ import android.hardware.biometrics.BiometricManager
 import android.hardware.biometrics.BiometricPrompt
 import android.os.Build
 import android.os.CancellationSignal
-import android.content.Intent
-import android.net.Uri
-import java.io.File
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
@@ -27,45 +24,40 @@ import javax.crypto.spec.PBEKeySpec
 
 class MainActivity : FlutterActivity() {
     private val prefs by lazy { getSharedPreferences("secure_accounts", MODE_PRIVATE) }
+    private val appearancePrefs by lazy { getSharedPreferences("appearance", MODE_PRIVATE) }
     private val alias = "swifty_protein_accounts"
+    private val moleculeImages by lazy { MoleculeImages(this) }
+
     override fun configureFlutterEngine(engine: FlutterEngine) {
         super.configureFlutterEngine(engine)
-        MethodChannel(engine.dartExecutor.binaryMessenger, "swifty_protein/share").setMethodCallHandler { call, result ->
-            if (call.method != "share") { result.notImplemented(); return@setMethodCallHandler }
-            try {
-                val png = call.argument<ByteArray>("png") ?: throw IllegalArgumentException("Missing image")
-                if (png.size > 10000000) throw IllegalArgumentException("Image too large")
-                File(cacheDir, "molecule.png").writeBytes(png)
-                val uri = Uri.parse("content://$packageName.share/molecule.png")
-                val intent = Intent(Intent.ACTION_SEND).apply {
-                    type = "image/png"
-                    putExtra(Intent.EXTRA_STREAM, uri)
-                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        engine.platformViewsController.registry.registerViewFactory(
+            "swifty_protein/molecule", MoleculeViewFactory(engine.dartExecutor.binaryMessenger),
+        )
+        MethodChannel(engine.dartExecutor.binaryMessenger, "swifty_protein/settings")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "getAppearance" -> result.success(appearancePrefs.getString("mode", "system"))
+                    "ligandCacheDirectory" -> result.success(java.io.File(filesDir, "ligand_cache").path)
+                    "setAppearance" -> when (val mode = call.arguments) {
+                        "system", "light", "dark" -> {
+                            appearancePrefs.edit().putString("mode", mode as String).apply()
+                            result.success(null)
+                        }
+                        else -> result.error("invalid_appearance", "Unknown appearance mode.", null)
+                    }
+                    else -> result.notImplemented()
                 }
-                startActivity(Intent.createChooser(intent, "Share molecule"))
-                result.success(null)
-            } catch (e: Exception) { result.error("share_failed", e.message, null) }
-        }
+            }
+        MethodChannel(engine.dartExecutor.binaryMessenger, "swifty_protein/share")
+            .setMethodCallHandler(moleculeImages::handle)
         MethodChannel(engine.dartExecutor.binaryMessenger, "swifty_protein/auth").setMethodCallHandler { call, result ->
             try {
                 when (call.method) {
                     "hasAccount" -> result.success(accounts().length() > 0)
                     "register" -> {
-                        val name = (call.argument<String>("username") ?: "").trim().lowercase()
-                        val password = call.argument<String>("password") ?: ""
-                        if (!name.matches(Regex("[a-z0-9_]{3,32}")) || password.length < 12)
-                            result.error("invalid", "Username: 3–32 letters, digits or underscores. Password: at least 12 characters.", null)
-                        else {
-                            val data = accounts()
-                            if (data.has(name)) result.error("exists", "Username already exists.", null)
-                            else {
-                                data.put(name, passwordRecord(password))
-                                save(data)
-                                prefs.edit().putString("last_user", name).apply()
-                                result.success(true)
-                            }
-                        }
+                        register(call.argument<String>("username"), call.argument<String>("password"), false, result)
                     }
+                    "registerWithBiometrics" -> register(call.argument<String>("username"), call.argument<String>("password"), true, result)
                     "login" -> {
                         val name = (call.argument<String>("username") ?: "").trim().lowercase()
                         val password = call.argument<String>("password") ?: ""
@@ -76,10 +68,20 @@ class MainActivity : FlutterActivity() {
                         } else result.error("invalid_credentials", "Incorrect username or password.", null)
                     }
                     "biometricAvailable" -> result.success(biometricAvailable())
+                    "biometricEnrollmentAvailable" -> result.success(deviceBiometricAvailable())
                     "biometricLogin" -> biometricLogin(result)
                     else -> result.notImplemented()
                 }
             } catch (e: Exception) { result.error("auth_error", e.message ?: "Authentication failed.", null) }
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == MoleculeImages.WRITE_PHOTOS) {
+            moleculeImages.finishLegacyPermission(grantResults)
         }
     }
     private fun key(): SecretKey {
@@ -118,21 +120,70 @@ class MainActivity : FlutterActivity() {
         val hash = Base64.decode(record.getString("hash"), Base64.NO_WRAP)
         return MessageDigest.isEqual(hash, derive(password, salt))
     }
+    private fun register(username: String?, password: String?, withBiometrics: Boolean, result: MethodChannel.Result) {
+        val name = (username ?: "").trim().lowercase()
+        val secret = password ?: ""
+        if (!name.matches(Regex("[a-z0-9_]{3,32}")) || secret.length < 12) {
+            result.error("invalid", "Username: 3–32 letters, digits or underscores. Password: at least 12 characters.", null)
+            return
+        }
+        if (accounts().has(name)) {
+            result.error("exists", "Username already exists.", null)
+            return
+        }
+        val createAccount = {
+            try {
+                val data = accounts()
+                if (data.has(name)) result.error("exists", "Username already exists.", null)
+                else {
+                    data.put(name, passwordRecord(secret))
+                    save(data)
+                    prefs.edit().putString("last_user", name).apply()
+                    result.success(true)
+                }
+            } catch (e: Exception) {
+                result.error("auth_error", e.message ?: "Could not create account.", null)
+            }
+        }
+        if (withBiometrics) authenticateBiometric(result, createAccount)
+        else createAccount()
+    }
+    private fun deviceBiometricAvailable(): Boolean {
+        return Build.VERSION.SDK_INT >= 29 &&
+            getSystemService(BiometricManager::class.java).canAuthenticate() == BiometricManager.BIOMETRIC_SUCCESS
+    }
     private fun biometricAvailable(): Boolean {
-        if (Build.VERSION.SDK_INT < 29 || prefs.getString("last_user", null) == null) return false
-        return getSystemService(BiometricManager::class.java).canAuthenticate() == BiometricManager.BIOMETRIC_SUCCESS
+        return prefs.getString("last_user", null) != null && deviceBiometricAvailable()
     }
     private fun biometricLogin(result: MethodChannel.Result) {
         if (!biometricAvailable()) { result.error("unavailable", "Biometric authentication is unavailable.", null); return }
-        if (Build.VERSION.SDK_INT >= 29) {
-            val completed = AtomicBoolean(false)
-            BiometricPrompt.Builder(this).setTitle("Unlock Swifty Protein")
-                .setSubtitle("Confirm your identity")
-                .setNegativeButton("Cancel", mainExecutor) { _, _ -> if (completed.compareAndSet(false, true)) result.error("cancelled", "Authentication cancelled.", null) }
-                .build().authenticate(CancellationSignal(), mainExecutor, object : BiometricPrompt.AuthenticationCallback() {
-                    override fun onAuthenticationSucceeded(authResult: BiometricPrompt.AuthenticationResult) { if (completed.compareAndSet(false, true)) result.success(true) }
-                    override fun onAuthenticationError(errorCode: Int, errString: CharSequence) { if (completed.compareAndSet(false, true)) result.error("biometric_failed", errString.toString(), null) }
-                })
+        authenticateBiometric(result) { result.success(true) }
+    }
+    private fun authenticateBiometric(result: MethodChannel.Result, onSuccess: () -> Unit) {
+        if (!deviceBiometricAvailable()) {
+            result.error("unavailable", "Biometric authentication is unavailable.", null)
+            return
         }
+        val completed = AtomicBoolean(false)
+        val cancellation = CancellationSignal()
+        BiometricPrompt.Builder(this).setTitle("Unlock Swifty Protein")
+            .setSubtitle("Confirm your identity")
+            .setNegativeButton("Cancel", mainExecutor) { _, _ ->
+                if (completed.compareAndSet(false, true)) result.error("cancelled", "Authentication cancelled.", null)
+            }
+            .build().authenticate(cancellation, mainExecutor, object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(authResult: BiometricPrompt.AuthenticationResult) {
+                    if (completed.compareAndSet(false, true)) onSuccess()
+                }
+                override fun onAuthenticationFailed() {
+                    if (completed.compareAndSet(false, true)) {
+                        cancellation.cancel()
+                        result.error("biometric_failed", "Biometric authentication failed. Try again.", null)
+                    }
+                }
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                    if (completed.compareAndSet(false, true)) result.error("biometric_failed", errString.toString(), null)
+                }
+            })
     }
 }

@@ -1,31 +1,82 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
-import 'dart:math' as math;
-import 'dart:ui' as ui;
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 
-import 'ligand.dart';
+import 'appearance.dart';
 import 'auth.dart';
+import 'launch_screen.dart';
+import 'ligand.dart';
+import 'ligand_cache.dart';
+import 'ligand_view.dart';
 
 void main() => runApp(const ProteinApp());
 
-class ProteinApp extends StatelessWidget {
+class ProteinApp extends StatefulWidget {
   const ProteinApp({super.key});
+
   @override
-  Widget build(BuildContext context) => MaterialApp(
-    title: 'Swifty Protein',
-    theme: ThemeData(
-      colorScheme: ColorScheme.fromSeed(
-        seedColor: const Color(0xff37c9bb),
-        brightness: Brightness.dark,
-      ),
-      useMaterial3: true,
+  State<ProteinApp> createState() => _ProteinAppState();
+}
+
+class _ProteinAppState extends State<ProteinApp> {
+  static const _settings = MethodChannel('swifty_protein/settings');
+  static final _lightTheme = buildAppTheme(Brightness.light);
+  static final _darkTheme = buildAppTheme(Brightness.dark);
+  ThemeMode _mode = ThemeMode.system;
+  bool _modeWasSelected = false;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_restoreAppearance());
+  }
+
+  Future<void> _restoreAppearance() async {
+    try {
+      final saved = await _settings.invokeMethod<String>('getAppearance');
+      if (!mounted || _modeWasSelected) return;
+      setState(() {
+        _mode = switch (saved) {
+          'light' => ThemeMode.light,
+          'dark' => ThemeMode.dark,
+          _ => ThemeMode.system,
+        };
+      });
+    } on MissingPluginException {
+      // Follow the platform setting when storage is unavailable.
+    } on PlatformException {
+      // Follow the platform setting when storage is unavailable.
+    }
+  }
+
+  Future<void> _setAppearance(ThemeMode mode) async {
+    _modeWasSelected = true;
+    setState(() => _mode = mode);
+    try {
+      await _settings.invokeMethod<void>('setAppearance', mode.name);
+    } on MissingPluginException {
+      // Keep the chosen appearance for this session.
+    } on PlatformException {
+      // Keep the chosen appearance for this session.
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Appearance(
+    mode: _mode,
+    onChanged: _setAppearance,
+    child: MaterialApp(
+      title: 'Swifty Protein',
+      theme: _lightTheme,
+      darkTheme: _darkTheme,
+      themeMode: _mode,
+      home: const LaunchScreen(child: AuthGate(child: LigandList())),
     ),
-    home: const AuthGate(child: LigandList()),
   );
 }
 
@@ -36,82 +87,97 @@ class LigandList extends StatefulWidget {
 }
 
 class _LigandListState extends State<LigandList> {
-  List<String> ids = [];
-  String query = '';
+  static final _cache = LigandCache(() async {
+    try {
+      const settings = MethodChannel('swifty_protein/settings');
+      final path = await settings.invokeMethod<String>('ligandCacheDirectory');
+      return path == null ? null : Directory(path);
+    } on MissingPluginException {
+      return null;
+    } on PlatformException {
+      return null;
+    }
+  });
+
+  List<({String id, String searchId})> _ids = [];
+  List<({String id, String searchId})> _shown = [];
+  final _search = TextEditingController();
   String? loading;
   Ligand? current;
+
   @override
   void initState() {
     super.initState();
     rootBundle.loadString('ligands.txt').then((text) {
-      if (mounted)
-        setState(
-          () => ids = text
-              .split(RegExp(r'\r?\n'))
-              .map((s) => s.trim())
-              .where((s) => RegExp(r'^[A-Za-z0-9]{1,5}$').hasMatch(s))
-              .toList(),
-        );
+      if (!mounted) return;
+      _ids = [
+        for (final line in const LineSplitter().convert(text))
+          if (line.trim().isNotEmpty)
+            (id: line.trim(), searchId: line.trim().toLowerCase()),
+      ];
+      _filter(_search.text);
     });
   }
 
+  void _filter(String query) {
+    final term = query.toLowerCase();
+    setState(() {
+      _shown = term.isEmpty
+          ? _ids
+          : _ids.where((entry) => entry.searchId.contains(term)).toList();
+    });
+  }
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
   Future<void> open(String id) async {
+    if (loading != null) return;
     setState(() => loading = id);
+
+    final Ligand molecule;
     try {
-      final client = HttpClient()
-        ..connectionTimeout = const Duration(seconds: 12);
-      try {
-        final request = await client
-            .getUrl(Uri.parse('https://files.rcsb.org/ligands/view/$id.cif'))
-            .timeout(const Duration(seconds: 15));
-        final response = await request.close().timeout(
-          const Duration(seconds: 15),
-        );
-        if (response.statusCode == 404)
-          throw const HttpException('Ligand not found (404).');
-        if (response.statusCode != 200)
-          throw HttpException('Server returned ${response.statusCode}.');
-        final chunks = <int>[];
-        await for (final chunk in response.timeout(
-          const Duration(seconds: 20),
-        )) {
-          chunks.addAll(chunk);
-          if (chunks.length > 5000000) {
-            throw const FormatException('Molecule is too large.');
-          }
-        }
-        final text = const SystemEncoding().decode(chunks);
-        final molecule = await compute(_parse, (id, text));
-        if (mounted) setState(() => current = molecule);
-      } finally {
-        client.close(force: true);
-      }
+      molecule = await _cache.load(
+        id,
+        download: () => _downloadCif(id),
+        parse: (id, bytes) => compute(_parse, (id, bytes)),
+      );
     } catch (error) {
-      if (mounted) {
-        final message = error is TimeoutException
-            ? 'Request timeout. Please try again.'
-            : error is SocketException
-            ? 'No internet connection. Please check your network.'
-            : error is FormatException
-            ? 'Failed to parse ligand data. ${error.message}'
-            : error.toString();
-        await showDialog<void>(
-          context: context,
-          builder: (_) => AlertDialog(
-            title: const Text('Could not load ligand'),
-            content: Text(message),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('OK'),
-              ),
-            ],
-          ),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => loading = null);
+      if (!mounted) return;
+      setState(() => loading = null);
+      final message = switch (error) {
+        TimeoutException() => 'Request timeout. Please try again.',
+        SocketException() =>
+          'No internet connection. Please check your network.',
+        FormatException() =>
+          'Failed to parse ligand data. The file may be corrupted.',
+        _LigandLoadFailure(:final message) => message,
+        _ => 'Could not download the ligand from RCSB. Please try again.',
+      };
+      await showDialog<void>(
+        context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('Could not load ligand'),
+          content: Text(message),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+      return;
     }
+
+    if (!mounted) return;
+    setState(() {
+      loading = null;
+      current = molecule;
+    });
   }
 
   @override
@@ -122,46 +188,57 @@ class _LigandListState extends State<LigandList> {
         onBack: () => setState(() => current = null),
       );
     }
-    final shown = ids
-        .where((s) => s.toLowerCase().contains(query.toLowerCase()))
-        .toList();
+    final scheme = Theme.of(context).colorScheme;
+    final motion = MediaQuery.disableAnimationsOf(context)
+        ? Duration.zero
+        : const Duration(milliseconds: 160);
     return Scaffold(
-      appBar: AppBar(title: const Text('Swifty Protein')),
+      appBar: AppBar(
+        title: const Text('Swifty Protein'),
+        actions: const [AppearanceButton()],
+      ),
       body: Column(
         children: [
+          SizedBox(
+            height: 4,
+            child: loading == null
+                ? null
+                : LinearProgressIndicator(semanticsLabel: 'Loading $loading'),
+          ),
           Padding(
             padding: const EdgeInsets.all(16),
             child: TextField(
+              controller: _search,
               decoration: const InputDecoration(
                 prefixIcon: Icon(Icons.search),
                 labelText: 'Search ligands',
-                border: OutlineInputBorder(),
               ),
-              onChanged: (s) => setState(() => query = s),
+              onChanged: _filter,
             ),
           ),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16),
             child: Align(
               alignment: Alignment.centerLeft,
-              child: Text('${shown.length} ligands'),
+              child: AnimatedSwitcher(
+                duration: motion,
+                child: Text(
+                  '${_shown.length} ligands',
+                  key: ValueKey(_shown.length),
+                  style: TextStyle(color: scheme.tertiary),
+                ),
+              ),
             ),
           ),
           Expanded(
             child: ListView.builder(
-              itemCount: shown.length,
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+              itemCount: _shown.length,
               itemBuilder: (context, index) {
-                final id = shown[index];
-                return ListTile(
-                  title: Text(id),
-                  leading: const Icon(Icons.bubble_chart),
-                  trailing: loading == id
-                      ? const SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.chevron_right),
+                final id = _shown[index].id;
+                return _LigandCard(
+                  id: id,
+                  loading: loading == id,
                   onTap: loading == null ? () => open(id) : null,
                 );
               },
@@ -173,210 +250,101 @@ class _LigandListState extends State<LigandList> {
   }
 }
 
-Ligand _parse((String, String) input) => parseLigand(input.$1, input.$2);
+class _LigandCard extends StatelessWidget {
+  const _LigandCard({required this.id, required this.loading, this.onTap});
 
-class LigandView extends StatefulWidget {
-  const LigandView({super.key, required this.ligand, required this.onBack});
-  final Ligand ligand;
-  final VoidCallback onBack;
-  @override
-  State<LigandView> createState() => _LigandViewState();
-}
-
-class _LigandViewState extends State<LigandView> {
-  static const shareChannel = MethodChannel('swifty_protein/share');
-  final imageKey = GlobalKey();
-  double yaw = .3, pitch = .25, zoom = 1, startZoom = 1;
-  Atom? selected;
-  Future<void> shareImage() async {
-    try {
-      final boundary =
-          imageKey.currentContext!.findRenderObject() as RenderRepaintBoundary;
-      final image = await boundary.toImage(pixelRatio: 2);
-      final data = await image.toByteData(format: ui.ImageByteFormat.png);
-      image.dispose();
-      if (data == null) throw StateError('Screenshot failed.');
-      await shareChannel.invokeMethod<void>('share', {
-        'png': data.buffer.asUint8List(),
-        'name': widget.ligand.id,
-      });
-    } catch (error) {
-      if (mounted)
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not share image: $error')),
-        );
-    }
-  }
+  final String id;
+  final bool loading;
+  final VoidCallback? onTap;
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(
-      leading: IconButton(
-        icon: const Icon(Icons.arrow_back),
-        onPressed: widget.onBack,
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final scheme = theme.colorScheme;
+    final shape = RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(14),
+      side: BorderSide(
+        color: loading ? scheme.tertiary : scheme.outlineVariant,
       ),
-      title: Text(widget.ligand.id),
-      actions: [
-        IconButton(
-          icon: const Icon(Icons.share),
-          tooltip: 'Share molecule image',
-          onPressed: shareImage,
-        ),
-      ],
-    ),
-    body: Column(
-      children: [
-        Expanded(
-          child: LayoutBuilder(
-            builder: (context, box) => GestureDetector(
-              onScaleStart: (_) => startZoom = zoom,
-              onScaleUpdate: (details) => setState(() {
-                yaw += details.focalPointDelta.dx * .008;
-                pitch += details.focalPointDelta.dy * .008;
-                zoom = (startZoom * details.scale).clamp(.25, 5);
-              }),
-              onTapUp: (details) => setState(
-                () => selected =
-                    MoleculePainter(widget.ligand, yaw, pitch, zoom).atomAt(
-                      Size(box.maxWidth, box.maxHeight),
-                      details.localPosition,
+    );
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Material(
+        color: scheme.surfaceContainerLow,
+        shape: shape,
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          customBorder: shape,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            child: Row(
+              children: [
+                DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: brandPine,
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.all(6),
+                    child: Image.asset(
+                      'assets/brand/molecule.png',
+                      width: 26,
+                      height: 26,
+                      excludeFromSemantics: true,
                     ),
-              ),
-              child: RepaintBoundary(
-                key: imageKey,
-                child: CustomPaint(
-                  size: Size.infinite,
-                  painter: MoleculePainter(widget.ligand, yaw, pitch, zoom),
+                  ),
                 ),
-              ),
+                const SizedBox(width: 14),
+                Expanded(child: Text(id, style: theme.textTheme.titleMedium)),
+                if (loading)
+                  Text('Loading…', style: TextStyle(color: scheme.tertiary))
+                else
+                  Icon(Icons.chevron_right, color: scheme.onSurfaceVariant),
+              ],
             ),
           ),
         ),
-        if (selected != null)
-          Padding(
-            padding: const EdgeInsets.all(16),
-            child: Text(
-              '${selected!.element} · ${selected!.id}   (${selected!.x.toStringAsFixed(2)}, ${selected!.y.toStringAsFixed(2)}, ${selected!.z.toStringAsFixed(2)})',
-            ),
-          ),
-        Padding(
-          padding: const EdgeInsets.all(16),
-          child: Text(
-            '${widget.ligand.atoms.length} atoms · ${widget.ligand.bonds.length} bonds   Drag to rotate · Pinch to zoom',
-          ),
-        ),
-      ],
-    ),
-  );
+      ),
+    );
+  }
 }
 
-class MoleculePainter extends CustomPainter {
-  MoleculePainter(this.ligand, this.yaw, this.pitch, this.zoom);
-  final Ligand ligand;
-  final double yaw, pitch, zoom;
-  static const colors = {
-    'C': Color(0xff999999),
-    'H': Colors.white,
-    'O': Colors.red,
-    'N': Colors.blue,
-    'S': Colors.yellow,
-    'P': Colors.orange,
-    'F': Colors.green,
-    'CL': Colors.green,
-    'BR': Color(0xffaa3322),
-    'I': Color(0xff7b35a8),
-  };
-  List<(Offset, double, Atom)> project(Size size) {
-    final cx =
-        ligand.atoms.map((a) => a.x).reduce((a, b) => a + b) /
-        ligand.atoms.length;
-    final cy =
-        ligand.atoms.map((a) => a.y).reduce((a, b) => a + b) /
-        ligand.atoms.length;
-    final cz =
-        ligand.atoms.map((a) => a.z).reduce((a, b) => a + b) /
-        ligand.atoms.length;
-    final radius = ligand.atoms
-        .map(
-          (a) => math.sqrt(
-            math.pow(a.x - cx, 2) +
-                math.pow(a.y - cy, 2) +
-                math.pow(a.z - cz, 2),
-          ),
-        )
-        .reduce(math.max)
-        .clamp(1.0, double.infinity);
-    final scale = math.min(size.width, size.height) * .38 * zoom / radius;
-    return [
-      for (final a in ligand.atoms)
-        () {
-          final x = a.x - cx, y = a.y - cy, z = a.z - cz;
-          final rx = x * math.cos(yaw) - z * math.sin(yaw),
-              rz = x * math.sin(yaw) + z * math.cos(yaw);
-          final ry = y * math.cos(pitch) - rz * math.sin(pitch),
-              depth = y * math.sin(pitch) + rz * math.cos(pitch);
-          return (
-            Offset(size.width / 2 + rx * scale, size.height / 2 + ry * scale),
-            depth,
-            a,
-          );
-        }(),
-    ];
-  }
+class _LigandLoadFailure implements Exception {
+  const _LigandLoadFailure(this.message);
 
-  Atom? atomAt(Size size, Offset point) {
-    final hits =
-        project(size)
-            .where((entry) => (entry.$1 - point).distance < 19)
-            .toList()
-          ..sort((a, b) => b.$2.compareTo(a.$2));
-    return hits.isEmpty ? null : hits.first.$3;
-  }
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    canvas.drawColor(const Color(0xff101b29), BlendMode.src);
-    final points = project(size);
-    final strokes = <(double, void Function())>[];
-    for (final bond in ligand.bonds) {
-      final a = points[bond.a], b = points[bond.b];
-      strokes.add((
-        (a.$2 + b.$2) / 2,
-        () => canvas.drawLine(
-          a.$1,
-          b.$1,
-          Paint()
-            ..color = const Color(0xffaebdca)
-            ..strokeWidth = 5
-            ..strokeCap = StrokeCap.round,
-        ),
-      ));
-    }
-    for (final entry in points) {
-      strokes.add((
-        entry.$2,
-        () {
-          final color =
-              colors[entry.$3.element.toUpperCase()] ?? const Color(0xffbf84d8);
-          canvas.drawCircle(entry.$1, 9, Paint()..color = color);
-          canvas.drawCircle(
-            entry.$1 + const Offset(-2, -2),
-            3,
-            Paint()..color = Colors.white.withValues(alpha: .3),
-          );
-        },
-      ));
-    }
-    strokes.sort((a, b) => a.$1.compareTo(b.$1));
-    for (final stroke in strokes) {
-      stroke.$2();
-    }
-  }
-
-  @override
-  bool shouldRepaint(MoleculePainter old) =>
-      old.ligand != ligand ||
-      old.yaw != yaw ||
-      old.pitch != pitch ||
-      old.zoom != zoom;
+  final String message;
 }
+
+Future<Uint8List> _downloadCif(String id) async {
+  final client = HttpClient();
+  try {
+    final request = await client
+        .getUrl(Uri.parse('https://files.rcsb.org/ligands/view/$id.cif'))
+        .timeout(const Duration(seconds: 15));
+    final response = await request.close().timeout(const Duration(seconds: 15));
+    if (response.statusCode == HttpStatus.notFound) {
+      throw const _LigandLoadFailure(
+        'Ligand not found (404). This ligand may not exist in the database.',
+      );
+    }
+    if (response.statusCode != HttpStatus.ok) {
+      throw _LigandLoadFailure(
+        'RCSB returned HTTP ${response.statusCode}. Please try again.',
+      );
+    }
+    final bytes = BytesBuilder(copy: false);
+    await for (final chunk in response.timeout(const Duration(seconds: 20))) {
+      if (bytes.length + chunk.length > LigandCache.maxFileBytes) {
+        throw const _LigandLoadFailure('The ligand file is too large to load.');
+      }
+      bytes.add(chunk);
+    }
+    return bytes.takeBytes();
+  } finally {
+    client.close(force: true);
+  }
+}
+
+Ligand _parse((String, Uint8List) input) =>
+    parseLigand(input.$1, utf8.decode(input.$2));

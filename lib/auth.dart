@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'appearance.dart';
+
 class AuthGate extends StatefulWidget {
   const AuthGate({super.key, required this.child});
   final Widget child;
@@ -48,7 +50,12 @@ class _LoginPageState extends State<LoginPage> {
   final username = TextEditingController();
   final password = TextEditingController();
   bool hasAccount = true, biometric = false, busy = false, register = false;
+  bool biometricEnrollmentAvailable = false,
+      useBiometricsForRegistration = false;
   String? error;
+  String get credentialMethod => register
+      ? (useBiometricsForRegistration ? 'registerWithBiometrics' : 'register')
+      : 'login';
   @override
   void initState() {
     super.initState();
@@ -60,11 +67,15 @@ class _LoginPageState extends State<LoginPage> {
       final account = await channel.invokeMethod<bool>('hasAccount') ?? false;
       final available =
           await channel.invokeMethod<bool>('biometricAvailable') ?? false;
+      final enrollmentAvailable =
+          await channel.invokeMethod<bool>('biometricEnrollmentAvailable') ??
+          false;
       if (mounted)
         setState(() {
           hasAccount = account;
           register = !account;
           biometric = available;
+          biometricEnrollmentAvailable = enrollmentAvailable;
         });
     } on PlatformException catch (e) {
       if (mounted)
@@ -78,6 +89,8 @@ class _LoginPageState extends State<LoginPage> {
       busy = true;
       error = null;
     });
+    final biometricRequest =
+        method == 'biometricLogin' || method == 'registerWithBiometrics';
     try {
       await channel.invokeMethod<bool>(
         method,
@@ -88,8 +101,32 @@ class _LoginPageState extends State<LoginPage> {
       password.clear();
       if (mounted) widget.onSuccess();
     } on PlatformException catch (e) {
-      if (mounted)
-        setState(() => error = e.message ?? 'Authentication failed.');
+      if (mounted) {
+        if (biometricRequest &&
+            (e.code == 'biometric_failed' ||
+                e.code == 'unavailable' ||
+                e.code == 'cancelled')) {
+          await showDialog<void>(
+            context: context,
+            builder: (context) => AlertDialog(
+              title: const Text('Biometric authentication failed'),
+              content: Text(
+                e.code == 'cancelled'
+                    ? 'Authentication was cancelled.'
+                    : 'Biometric authentication failed or is no longer valid. ${e.message ?? 'Try again or use your password.'}',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('OK'),
+                ),
+              ],
+            ),
+          );
+        } else {
+          setState(() => error = e.message ?? 'Authentication failed.');
+        }
+      }
     } finally {
       if (mounted) setState(() => busy = false);
     }
@@ -104,6 +141,7 @@ class _LoginPageState extends State<LoginPage> {
 
   @override
   Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(actions: const [AppearanceButton()]),
     body: SafeArea(
       child: Center(
         child: SingleChildScrollView(
@@ -114,10 +152,22 @@ class _LoginPageState extends State<LoginPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  const Icon(
-                    Icons.bubble_chart,
-                    size: 72,
-                    color: Color(0xff37c9bb),
+                  Align(
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: brandPine,
+                        borderRadius: BorderRadius.circular(22),
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: Image.asset(
+                          'assets/brand/molecule.png',
+                          width: 54,
+                          height: 54,
+                          excludeFromSemantics: true,
+                        ),
+                      ),
+                    ),
                   ),
                   const SizedBox(height: 20),
                   Text(
@@ -130,10 +180,7 @@ class _LoginPageState extends State<LoginPage> {
                     controller: username,
                     enabled: !busy,
                     autocorrect: false,
-                    decoration: const InputDecoration(
-                      labelText: 'Username',
-                      border: OutlineInputBorder(),
-                    ),
+                    decoration: const InputDecoration(labelText: 'Username'),
                   ),
                   const SizedBox(height: 12),
                   TextField(
@@ -143,16 +190,22 @@ class _LoginPageState extends State<LoginPage> {
                     decoration: InputDecoration(
                       labelText: 'Password',
                       helperText: register ? 'At least 12 characters' : null,
-                      border: const OutlineInputBorder(),
                     ),
-                    onSubmitted: (_) =>
-                        _submit(register ? 'register' : 'login'),
+                    onSubmitted: (_) => _submit(credentialMethod),
                   ),
+                  if (register && biometricEnrollmentAvailable)
+                    SwitchListTile(
+                      title: const Text('Confirm with biometrics'),
+                      value: useBiometricsForRegistration,
+                      onChanged: busy
+                          ? null
+                          : (value) => setState(
+                              () => useBiometricsForRegistration = value,
+                            ),
+                    ),
                   const SizedBox(height: 20),
                   FilledButton(
-                    onPressed: busy
-                        ? null
-                        : () => _submit(register ? 'register' : 'login'),
+                    onPressed: busy ? null : () => _submit(credentialMethod),
                     child: Text(register ? 'Create account' : 'Log in'),
                   ),
                   if (!register && biometric)

@@ -32,6 +32,8 @@ migrate_working_dir/
 .pub/
 /build/
 /coverage/
+*.apk
+*.aab
 
 # Symbolication related
 app.*.symbols
@@ -40,6 +42,10 @@ app.*.symbols
 app.*.map.json
 
 # Android Studio will place build artifacts here
+/android/.gradle/
+/android/.kotlin/
+/android/build/
+/android/app/build/
 /android/app/debug
 /android/app/profile
 /android/app/release
@@ -48,12 +54,26 @@ app.*.map.json
 .widget_preview/
 
 # Local configuration and signing keys
-android/local.properties
+/android/local.properties
+/android/key.properties
+/android/app/key.properties
+/.agents/
+/.codex/
+/.aws/
 *.jks
 *.keystore
+*.p12
 *.env
+.env.*
+!.env.example
 google-services.json
 GoogleService-Info.plist
+
+# Local emulator and JVM crash dumps
+core
+core.*
+hs_err_pid*.log
+replay_pid*.log
 
 # Assignment inputs not needed by the app
 /Swifty Protein.pdf
